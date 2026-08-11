@@ -95,6 +95,56 @@ fn resolve_deploy_connection_type(
         .or_else(|| domain.connection_type.clone())
 }
 
+/// Collect a service's extra URL aliases.
+///
+/// Service-level only — an alias names one specific project, so `urls` does not
+/// cascade through group/domain/environment the way the resolved settings do.
+/// Blank entries are dropped so a stray `""` can't emit a `server_name ;` block
+/// that would make nginx refuse to start.
+fn resolve_deploy_urls(domain: &Domain, group_name: &str, service_name: &str) -> Vec<String> {
+    domain
+        .groups
+        .as_ref()
+        .and_then(|g| g.get(group_name))
+        .and_then(|g| g.services.as_ref())
+        .and_then(|s| s.get(service_name))
+        .and_then(|s| s.urls.as_ref())
+        .map(|urls| {
+            urls.iter()
+                .map(|u| u.trim())
+                .filter(|u| !u.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Render the nginx vhost that fronts one hostname for a service.
+///
+/// The Upgrade + Connection headers are harmless for plain HTTP and let WebSocket
+/// clients (`ws://{svc}.{dom}.test`, and Vite HMR arriving on an alias hostname)
+/// reach the upstream. The `$connection_upgrade` variable is defined in
+/// `assets/nginx.conf`.
+pub fn build_host_proxy_vhost(url: &str, host_gateway: &str, port: u16) -> String {
+    const TEMPLATE: &str = r#"server {
+    listen 80;
+    server_name {url};
+    location / {
+        proxy_pass http://{host_gateway}:{port}/;
+        proxy_set_header Host $host;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+    }
+}
+"#;
+
+    TEMPLATE
+        .replace("{url}", url)
+        .replace("{host_gateway}", host_gateway)
+        .replace("{port}", &port.to_string())
+}
+
 pub fn cmd_deploy(
     paths: &DarpPaths,
     config: &Config,
@@ -142,22 +192,6 @@ pub fn cmd_deploy(
             .collect();
     let mut next_debug_port = debug_base;
 
-    // HTTP / WebSocket vhost. The Upgrade + Connection headers are harmless for plain HTTP
-    // and allow WebSocket clients (ws://{svc}.{dom}.test) to reach the upstream. The
-    // $connection_upgrade variable is defined in assets/nginx.conf.
-    let host_proxy_template = r#"server {
-    listen 80;
-    server_name {url};
-    location / {
-        proxy_pass http://{host_gateway}:{port}/;
-        proxy_set_header Host $host;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-    }
-}
-"#;
-
     // Truncate vhost_container.conf at the start of each deploy so we don't
     // keep appending duplicate server blocks.
     std::fs::write(&paths.vhost_container_conf, b"")?;
@@ -187,6 +221,9 @@ pub fn cmd_deploy(
             let connection_type = resolve_deploy_connection_type(domain, group_name, folder_name)
                 .unwrap_or_else(|| "http".to_string());
 
+            // Extra hostnames that should reach this same service.
+            let aliases = resolve_deploy_urls(domain, group_name, folder_name);
+
             // Reuse this service's previously-assigned debug port when still valid,
             // else assign the next free one (skipping reserved + well-known ports).
             let debug_port = config::choose_debug_port(
@@ -211,6 +248,20 @@ pub fn cmd_deploy(
                 "debug_port".to_string(),
                 serde_json::Value::Number(debug_port.into()),
             );
+            // Aliases go into portmap.json so cmd_urls can list them without
+            // re-resolving config, mirroring how "type" is carried.
+            if !aliases.is_empty() {
+                entry.insert(
+                    "urls".to_string(),
+                    serde_json::Value::Array(
+                        aliases
+                            .iter()
+                            .cloned()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+            }
             let group_obj = domain_map
                 .entry(group_name.to_string())
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
@@ -218,16 +269,24 @@ pub fn cmd_deploy(
                 group_map.insert(folder_name.to_string(), serde_json::Value::Object(entry));
             }
 
-            let url = format!(
+            let canonical_url = format!(
                 "{folder}.{domain}.test",
                 folder = folder_name,
                 domain = domain_name
             );
 
-            // Every service gets a hosts entry — HTTP/WS clients reach the reverse proxy
+            // Canonical URL first, then any configured aliases.
+            let mut service_urls = Vec::with_capacity(1 + aliases.len());
+            service_urls.push(canonical_url);
+            service_urls.extend(aliases);
+
+            // Every URL gets a hosts entry — HTTP/WS clients reach the reverse proxy
             // on port 80 via this name; TCP clients reach localhost (the hostname is a
-            // loopback alias once urls_in_hosts syncs /etc/hosts).
-            hosts_container_lines.push(format!("0.0.0.0   {url}\n"));
+            // loopback alias once urls_in_hosts syncs /etc/hosts). Aliases are what
+            // make non-.test names resolve at all, since dnsmasq only wildcards .test.
+            for url in &service_urls {
+                hosts_container_lines.push(format!("0.0.0.0   {url}\n"));
+            }
 
             match connection_type.as_str() {
                 "tcp" => {
@@ -236,16 +295,16 @@ pub fn cmd_deploy(
                     // resolving via the service container's -p {auto_port}:8002 mapping.
                 }
                 _ => {
-                    let vhost = host_proxy_template
-                        .replace("{url}", &url)
-                        .replace("{host_gateway}", host_gateway)
-                        .replace("{port}", &port_number.to_string());
-
-                    std::fs::OpenOptions::new()
+                    let mut conf = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
-                        .open(&paths.vhost_container_conf)?
-                        .write_all(vhost.as_bytes())?;
+                        .open(&paths.vhost_container_conf)?;
+
+                    // One server block per URL, all proxying to the same upstream port.
+                    for url in &service_urls {
+                        let vhost = build_host_proxy_vhost(url, host_gateway, *port_number);
+                        conf.write_all(vhost.as_bytes())?;
+                    }
                 }
             }
 

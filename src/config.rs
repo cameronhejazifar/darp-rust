@@ -405,6 +405,20 @@ pub struct Group {
 pub struct Service {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_environment: Option<String>,
+    /// Extra hostnames that reach this service alongside its canonical
+    /// `{service}.{domain}.test` URL. Each one gets its own `/etc/hosts` entry and
+    /// its own nginx vhost proxying to the same upstream port, so a single dev
+    /// server can answer for several front-end hosts — e.g. a multi-tenant SPA that
+    /// selects its tenant from `window.location.hostname`.
+    ///
+    /// Aliases need not end in `.test`; darp writes a hosts entry for each, so
+    /// arbitrary names resolve to the loopback the reverse proxy listens on.
+    ///
+    /// Service-level and deploy-time only: an alias names one specific project, so
+    /// this field does not participate in the settings cascade and has no `*urls`
+    /// counterpart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urls: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_portmappings: Option<BTreeMap<String, String>>,
     #[serde(

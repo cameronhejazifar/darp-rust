@@ -49,7 +49,8 @@ The environment is determined by:
           "services": {
             "admin": {
               "serve_command": "php artisan serve --host 0.0.0.0",
-              "host_portmappings": { "8082": "8082" }
+              "host_portmappings": { "8082": "8082" },
+              "urls": ["local.admin.example.org"]
             }
           }
         }
@@ -113,6 +114,35 @@ Additionally:
 |---|---|---|
 | `default_environment` | Domain, Group, Service | Fallback environment when `-e` isn't passed |
 | `location` | Domain | Filesystem path to the domain folder |
+| `urls` | Service | Extra hostnames that reach this service alongside `{service}.{domain}.test` |
+
+## URL Aliases
+
+A service normally answers on one hostname, `{service}.{domain}.test`, derived
+from its folder name. `urls` adds more:
+
+```json
+"portal-website": {
+  "urls": ["local.comagine.org", "local.zoo.org"]
+}
+```
+
+`darp deploy` then writes a `/etc/hosts` entry and an nginx `server` block for
+each alias, all proxying to the same upstream port as the canonical URL. `darp
+urls` lists aliases indented under their service.
+
+Aliases do not have to end in `.test` — darp writes a hosts entry for each one,
+so any name resolves to the loopback the reverse proxy listens on. (Only `.test`
+is wildcard-resolved by dnsmasq; everything else needs the hosts entry, which is
+exactly what this provides.)
+
+This exists for apps that behave differently per hostname — a multi-tenant
+front-end that picks its tenant from `window.location.hostname`, for instance.
+Because every alias reaches the same container on the same port, the app sees
+the original hostname in the `Host` header and can branch on it.
+
+`urls` is service-level only and applies at deploy time. It does not cascade
+through group/domain/environment and has no `*urls` override form.
 
 ## Viewing Resolved Config
 

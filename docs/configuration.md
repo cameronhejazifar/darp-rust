@@ -181,6 +181,37 @@ Valid:
 "urls": ["local.zoo.org", "tenant-a.portal.test"]
 ```
 
+### One hostname, one service
+
+Every HTTP/WebSocket hostname must identify exactly one service. nginx routes by
+`server_name`: if two server blocks declare the same name it ignores the second
+and sends all traffic for that hostname to whichever service was registered
+first — and registration follows directory-scan order, which is not stable, so
+the winner can change from one deploy to the next.
+
+`darp deploy` therefore refuses to deploy when a hostname is claimed twice, and
+reports every conflict at once:
+
+- An alias cannot duplicate another HTTP/WebSocket service's alias or canonical
+  URL.
+- Two canonical URLs cannot collide either. A canonical URL is
+  `{folder}.{domain}.test` with no group component, so two identically-named
+  folders in different groups of the same domain claim the same hostname.
+
+Comparison is case-insensitive, and a terminal DNS dot does not make a hostname
+unique — `LOCAL.ZOO.ORG`, `local.zoo.org.`, and `local.zoo.org` are one name.
+
+Repeated aliases *within* one service are not a conflict: they resolve to the
+same upstream, so they are deduplicated to a single hosts entry and a single
+server block. An alias equal to the service's own canonical URL is dropped for
+the same reason. This is what makes `pre_config` merging safe — array values
+concatenate, so a personal config re-listing a team alias is harmless.
+
+TCP services are exempt. They get no nginx server block and are distinguished by
+their assigned ports, so two TCP services — or a TCP service and an
+HTTP/WebSocket service — may share a hostname. Syntax validation and
+same-service deduplication still apply to their aliases.
+
 Invalid:
 
 ```json

@@ -8,7 +8,7 @@
 use darp::alias::{AliasErrorReason, validate_and_normalize_alias};
 use darp::commands::{
     PlannedService, build_host_proxy_vhost, build_hosts_lines, build_portmap,
-    build_vhost_container_conf, plan_deployment, validate_plan_aliases,
+    build_vhost_container_conf, detect_hostname_collisions, plan_deployment, validate_plan_aliases,
 };
 use darp::config::{Config, DarpPaths, merge_values};
 
@@ -751,4 +751,386 @@ fn portmap_keeps_a_configured_domain_with_no_service_folders() {
     let portmap = build_portmap(&[], &["comagine".to_string()]);
 
     assert_eq!(portmap["comagine"], serde_json::json!({}));
+}
+
+// ---------------------------------------------------------------------------
+// Same-service deduplication
+// ---------------------------------------------------------------------------
+
+#[test]
+fn repeated_alias_within_one_service_is_deduplicated() {
+    let mut services = vec![planned(
+        "comagine",
+        ".",
+        "portal-website",
+        &["local.zoo.org", "local.zoo.org"],
+    )];
+
+    validate_plan_aliases(&mut services).unwrap();
+
+    assert_eq!(services[0].aliases, vec!["local.zoo.org"]);
+}
+
+#[test]
+fn aliases_differing_only_by_case_or_trailing_dot_are_deduplicated() {
+    // DNS treats these as one name; emitting two vhosts for them would make nginx
+    // complain about a conflicting server_name.
+    let mut services = vec![planned(
+        "comagine",
+        ".",
+        "portal-website",
+        &["local.zoo.org", "LOCAL.Zoo.ORG", "local.zoo.org."],
+    )];
+
+    validate_plan_aliases(&mut services).unwrap();
+
+    assert_eq!(services[0].aliases, vec!["local.zoo.org"]);
+}
+
+#[test]
+fn alias_matching_its_own_canonical_hostname_is_dropped() {
+    let mut services = vec![planned(
+        "comagine",
+        ".",
+        "portal-website",
+        &["PORTAL-WEBSITE.comagine.test.", "local.zoo.org"],
+    )];
+
+    validate_plan_aliases(&mut services).unwrap();
+
+    // The canonical URL already has its own hosts entry and vhost.
+    assert_eq!(services[0].aliases, vec!["local.zoo.org"]);
+}
+
+#[test]
+fn merged_config_duplicates_are_deduplicated_in_first_seen_order() {
+    // What `pre_config` array concatenation produces when a personal config re-lists
+    // an alias the team config already set.
+    let merged = merge_values(
+        serde_json::json!({ "urls": ["local.zoo.org", "local.care.org"] }),
+        serde_json::json!({ "urls": ["local.care.org", "local.mine.org"] }),
+    );
+    let urls: Vec<String> = serde_json::from_value(merged["urls"].clone()).unwrap();
+    assert_eq!(urls.len(), 4, "merge concatenates before dedup");
+
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let mut services = vec![planned("comagine", ".", "portal-website", &refs)];
+
+    validate_plan_aliases(&mut services).unwrap();
+
+    assert_eq!(
+        services[0].aliases,
+        vec!["local.zoo.org", "local.care.org", "local.mine.org"]
+    );
+}
+
+#[test]
+fn deduplicated_aliases_emit_one_vhost_and_one_hosts_entry_each() {
+    let mut services = vec![planned(
+        "comagine",
+        ".",
+        "portal-website",
+        &["local.zoo.org", "LOCAL.ZOO.ORG"],
+    )];
+    validate_plan_aliases(&mut services).unwrap();
+
+    let conf = build_vhost_container_conf(&services, "gw");
+    let lines = build_hosts_lines(&services);
+
+    assert_eq!(conf.matches("server_name local.zoo.org;").count(), 1);
+    assert_eq!(conf.matches("server {").count(), 2); // canonical + one alias
+    assert_eq!(
+        lines,
+        vec![
+            "0.0.0.0   portal-website.comagine.test\n",
+            "0.0.0.0   local.zoo.org\n",
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-service HTTP/WebSocket collisions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_collision_for_a_plan_of_distinct_hostnames() {
+    let services = vec![
+        planned("comagine", ".", "portal-website", &["local.zoo.org"]),
+        planned_full(
+            "comagine",
+            "sites",
+            "zoo",
+            "http",
+            50101,
+            &["local.care.org"],
+        ),
+    ];
+
+    assert!(detect_hostname_collisions(&services).is_ok());
+}
+
+#[test]
+fn two_http_services_sharing_an_alias_is_rejected() {
+    let services = vec![
+        planned("comagine", ".", "portal-website", &["local.zoo.org"]),
+        planned_full(
+            "comagine",
+            "sites",
+            "zoo-website",
+            "http",
+            50101,
+            &["local.zoo.org"],
+        ),
+    ];
+
+    let err = detect_hostname_collisions(&services)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains(
+        "Cannot deploy because some HTTP/WebSocket hostnames are assigned to multiple services:"
+    ));
+    assert!(err.contains("  local.zoo.org\n"));
+    assert!(err.contains("alias for comagine/./portal-website (http)"));
+    assert!(err.contains("alias for comagine/sites/zoo-website (http)"));
+    assert!(err.contains("No deployment artifacts were changed."));
+}
+
+#[test]
+fn two_websocket_services_sharing_an_alias_is_rejected() {
+    let services = vec![
+        planned_full(
+            "comagine",
+            ".",
+            "hmr-a",
+            "websocket",
+            50100,
+            &["ws.zoo.org"],
+        ),
+        planned_full(
+            "comagine",
+            ".",
+            "hmr-b",
+            "websocket",
+            50101,
+            &["ws.zoo.org"],
+        ),
+    ];
+
+    let err = detect_hostname_collisions(&services)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("alias for comagine/./hmr-a (websocket)"));
+    assert!(err.contains("alias for comagine/./hmr-b (websocket)"));
+}
+
+#[test]
+fn http_and_websocket_services_sharing_an_alias_is_rejected() {
+    // Both land in nginx on port 80, so one silently shadows the other.
+    let services = vec![
+        planned("comagine", ".", "portal-website", &["local.zoo.org"]),
+        planned_full(
+            "comagine",
+            ".",
+            "hmr",
+            "websocket",
+            50101,
+            &["local.zoo.org"],
+        ),
+    ];
+
+    let err = detect_hostname_collisions(&services)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("alias for comagine/./hmr (websocket)"));
+    assert!(err.contains("alias for comagine/./portal-website (http)"));
+}
+
+#[test]
+fn alias_matching_another_services_canonical_url_is_rejected() {
+    let services = vec![
+        planned("comagine", ".", "admin", &[]),
+        planned_full(
+            "comagine",
+            "portals",
+            "portal-website",
+            "http",
+            50101,
+            &["admin.comagine.test"],
+        ),
+    ];
+
+    let err = detect_hostname_collisions(&services)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("  admin.comagine.test\n"));
+    assert!(err.contains("canonical URL for comagine/./admin (http)"));
+    assert!(err.contains("alias for comagine/portals/portal-website (http)"));
+}
+
+#[test]
+fn canonical_hostnames_colliding_across_groups_are_rejected() {
+    // A canonical URL is {folder}.{domain}.test with no group component, so two
+    // same-named folders in different groups claim the same hostname and nginx picks
+    // one by read_dir order.
+    let services = vec![
+        planned_full("comagine", "sites", "admin", "http", 50100, &[]),
+        planned_full("comagine", "portals", "admin", "http", 50101, &[]),
+    ];
+
+    let err = detect_hostname_collisions(&services)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("canonical URL for comagine/portals/admin (http)"));
+    assert!(err.contains("canonical URL for comagine/sites/admin (http)"));
+}
+
+#[test]
+fn collision_detection_is_case_insensitive_and_ignores_a_trailing_dot() {
+    let services = vec![
+        planned("comagine", ".", "portal-website", &["LOCAL.ZOO.ORG"]),
+        planned_full(
+            "comagine",
+            "sites",
+            "zoo-website",
+            "http",
+            50101,
+            &["local.zoo.org."],
+        ),
+    ];
+
+    // Raw config spellings differ, so only comparison in normalized form catches it.
+    assert!(detect_hostname_collisions(&services).is_err());
+}
+
+#[test]
+fn every_collision_is_reported_in_one_deterministic_error() {
+    let services = vec![
+        planned(
+            "comagine",
+            ".",
+            "portal-website",
+            &["local.zoo.org", "admin.comagine.test"],
+        ),
+        planned_full(
+            "comagine",
+            "sites",
+            "zoo-website",
+            "http",
+            50101,
+            &["local.zoo.org"],
+        ),
+        planned_full("comagine", ".", "admin", "http", 50102, &[]),
+    ];
+
+    let err = detect_hostname_collisions(&services)
+        .unwrap_err()
+        .to_string();
+
+    let admin = err.find("  admin.comagine.test\n").unwrap();
+    let zoo = err.find("  local.zoo.org\n").unwrap();
+    assert!(admin < zoo, "hostnames must be reported in sorted order");
+
+    // Owners of one hostname are ordered by service identity, not discovery order.
+    let portal = err.find("alias for comagine/./portal-website").unwrap();
+    let zoo_website = err.find("alias for comagine/sites/zoo-website").unwrap();
+    assert!(portal < zoo_website);
+}
+
+// ---------------------------------------------------------------------------
+// TCP hostname reuse stays legal
+// ---------------------------------------------------------------------------
+
+#[test]
+fn two_tcp_services_may_share_a_hostname() {
+    // Their assigned ports distinguish them; neither gets an nginx server block.
+    let services = vec![
+        planned_full("uhin", ".", "db-a", "tcp", 50100, &["local.db.org"]),
+        planned_full("uhin", ".", "db-b", "tcp", 50101, &["local.db.org"]),
+    ];
+
+    assert!(detect_hostname_collisions(&services).is_ok());
+}
+
+#[test]
+fn a_tcp_service_may_share_a_hostname_with_http_or_websocket() {
+    let services = vec![
+        planned_full("uhin", ".", "queue", "tcp", 50100, &["local.zoo.org"]),
+        planned_full("uhin", ".", "web", "http", 50101, &["local.zoo.org"]),
+        planned_full("uhin", ".", "hmr", "websocket", 50102, &["ws.zoo.org"]),
+        planned_full("uhin", ".", "stream", "tcp", 50103, &["ws.zoo.org"]),
+    ];
+
+    assert!(detect_hostname_collisions(&services).is_ok());
+}
+
+#[test]
+fn tcp_service_aliases_are_still_deduplicated() {
+    let mut services = vec![planned_full(
+        "uhin",
+        ".",
+        "queue",
+        "tcp",
+        50100,
+        &["local.queue.org", "LOCAL.QUEUE.ORG."],
+    )];
+
+    validate_plan_aliases(&mut services).unwrap();
+
+    assert_eq!(services[0].aliases, vec!["local.queue.org"]);
+    assert_eq!(
+        build_hosts_lines(&services),
+        vec!["0.0.0.0   queue.uhin.test\n", "0.0.0.0   local.queue.org\n",]
+    );
+}
+
+#[test]
+fn a_tcp_and_an_http_service_sharing_a_hostname_emit_one_hosts_entry() {
+    let services = vec![
+        planned_full("uhin", ".", "queue", "tcp", 50100, &["local.zoo.org"]),
+        planned_full("uhin", ".", "web", "http", 50101, &["local.zoo.org"]),
+    ];
+
+    let lines = build_hosts_lines(&services);
+
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("local.zoo.org")).count(),
+        1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Collisions are caught before anything is written
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_collision_leaves_existing_deployment_artifacts_untouched() {
+    let s = scratch(
+        &["portal-website", "zoo-website"],
+        r#"{
+            "domains": {
+                "comagine": {
+                    "location": "{loc}",
+                    "groups": {
+                        ".": {
+                            "services": {
+                                "portal-website": { "urls": ["local.zoo.org"] },
+                                "zoo-website": { "urls": ["LOCAL.ZOO.ORG"] }
+                            }
+                        }
+                    }
+                }
+            }
+        }"#,
+    );
+
+    let mut services = plan_deployment(&s.paths, &s.config).unwrap();
+    validate_plan_aliases(&mut services).unwrap();
+    assert!(detect_hostname_collisions(&services).is_err());
+
+    // Everything the old deployment depends on — vhosts, container hosts, portmap —
+    // survives, and no infrastructure container was touched to get here.
+    s.assert_artifacts_untouched();
 }

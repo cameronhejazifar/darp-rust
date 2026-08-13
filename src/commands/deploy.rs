@@ -171,6 +171,13 @@ impl PlannedService {
         self.connection_type != "tcp"
     }
 
+    /// Canonical hostname in comparison form. Folder names are not hostname-validated
+    /// — darp has always passed them through as-is — so only case and a trailing dot
+    /// are normalized here, which is what DNS-correct comparison needs.
+    fn canonical_key(&self) -> String {
+        alias::normalize_for_comparison(&self.canonical_hostname)
+    }
+
     /// Every hostname that reaches this service: canonical first, then aliases in
     /// configured order.
     fn hostnames(&self) -> Vec<String> {
@@ -308,14 +315,26 @@ pub fn plan_deployment(paths: &DarpPaths, config: &Config) -> anyhow::Result<Vec
 /// Every failure across the whole deployment is collected and reported together,
 /// ordered by service then original alias text, so one `darp deploy` surfaces the
 /// full list rather than one problem per run.
+///
+/// Surviving aliases are also deduplicated within the service — repeats, and any
+/// alias equal to the service's own canonical URL, collapse to one entry in
+/// first-seen order. They all point at the same upstream, so this is not a
+/// collision; `pre_config` array merging routinely produces such repeats when a
+/// personal config re-lists an alias the team config already set.
 pub fn validate_plan_aliases(services: &mut [PlannedService]) -> anyhow::Result<()> {
     let mut failures: Vec<(String, AliasValidationError)> = Vec::new();
 
     for svc in services.iter_mut() {
         let mut normalized = Vec::with_capacity(svc.aliases.len());
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(svc.canonical_key());
         for raw in &svc.aliases {
             match alias::validate_and_normalize_alias(raw) {
-                Ok(hostname) => normalized.push(hostname),
+                Ok(hostname) => {
+                    if seen.insert(hostname.clone()) {
+                        normalized.push(hostname);
+                    }
+                }
                 Err(e) => failures.push((svc.label(), e)),
             }
         }
@@ -342,6 +361,107 @@ pub fn validate_plan_aliases(services: &mut [PlannedService]) -> anyhow::Result<
     }
     msg.push_str(
         "\nConfigure hostname-only values such as `local.zoo.org` and run `darp deploy` again.\n\
+         \nNo deployment artifacts were changed.",
+    );
+
+    anyhow::bail!(msg)
+}
+
+/// Whether a registered hostname is a service's canonical URL or one of its aliases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HostnameSource {
+    Canonical,
+    Alias,
+}
+
+impl HostnameSource {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Canonical => "canonical URL",
+            Self::Alias => "alias",
+        }
+    }
+}
+
+/// One claim on an HTTP/WebSocket hostname.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct HostnameOwner {
+    domain: String,
+    group: String,
+    service: String,
+    source: HostnameSource,
+    connection_type: String,
+}
+
+/// Reject any HTTP/WebSocket hostname claimed by more than one service.
+///
+/// nginx routes by `server_name`. When two server blocks declare the same name it
+/// ignores the second and sends every request for that hostname to whichever
+/// service was registered first — and registration order follows `read_dir`, which
+/// is unstable, so the winner can change between deploys. Silently routing a
+/// hostname to the wrong project is worse than refusing to deploy.
+///
+/// Catches alias-to-alias, alias-to-canonical, and canonical-to-canonical claims.
+/// The last case includes two same-named folders in different groups, because a
+/// canonical hostname is `{folder}.{domain}.test` with no group component.
+///
+/// TCP services are exempt: they get no vhost, and their assigned ports already
+/// distinguish them, so sharing a hostname with each other or with an HTTP/WebSocket
+/// service is safe.
+pub fn detect_hostname_collisions(services: &[PlannedService]) -> anyhow::Result<()> {
+    // BTreeMap keys the report by hostname in a stable order regardless of the
+    // discovery order the collisions were found in.
+    let mut registry: std::collections::BTreeMap<String, Vec<HostnameOwner>> =
+        std::collections::BTreeMap::new();
+
+    for svc in services.iter().filter(|s| s.is_host_routed()) {
+        let mut claim = |hostname: String, source: HostnameSource| {
+            registry.entry(hostname).or_default().push(HostnameOwner {
+                domain: svc.domain.clone(),
+                group: svc.group.clone(),
+                service: svc.service.clone(),
+                source,
+                connection_type: svc.connection_type.clone(),
+            });
+        };
+
+        claim(svc.canonical_key(), HostnameSource::Canonical);
+        for a in &svc.aliases {
+            claim(alias::normalize_for_comparison(a), HostnameSource::Alias);
+        }
+    }
+
+    let mut msg = String::from(
+        "Cannot deploy because some HTTP/WebSocket hostnames are assigned to multiple services:\n\n",
+    );
+    let mut found = false;
+    for (hostname, owners) in registry.iter_mut() {
+        if owners.len() < 2 {
+            continue;
+        }
+        found = true;
+        owners.sort();
+        msg.push_str(&format!("  {hostname}\n"));
+        for owner in owners.iter() {
+            msg.push_str(&format!(
+                "    {} for {}/{}/{} ({})\n",
+                owner.source.describe(),
+                owner.domain,
+                owner.group,
+                owner.service,
+                owner.connection_type
+            ));
+        }
+        msg.push('\n');
+    }
+
+    if !found {
+        return Ok(());
+    }
+
+    msg.push_str(
+        "Each HTTP/WebSocket hostname must map to exactly one service. Remove or rename the\n\
+         conflicting aliases and run `darp deploy` again.\n\
          \nNo deployment artifacts were changed.",
     );
 
@@ -473,6 +593,7 @@ pub fn cmd_deploy(
     // ---- Discover and validate the whole deployment before mutating anything ----
     let mut services = plan_deployment(paths, config)?;
     validate_plan_aliases(&mut services)?;
+    detect_hostname_collisions(&services)?;
 
     // ---- Generate artifacts and restart infrastructure ----
 

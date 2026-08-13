@@ -468,6 +468,97 @@ pub fn detect_hostname_collisions(services: &[PlannedService]) -> anyhow::Result
     anyhow::bail!(msg)
 }
 
+/// An alias darp generated a vhost for but did not make resolvable itself.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnresolvedAlias {
+    pub domain: String,
+    pub group: String,
+    pub service: String,
+    pub hostname: String,
+}
+
+/// Collect the aliases darp has generated proxy config for without providing host
+/// name resolution.
+///
+/// darp's dnsmasq config is `address=/.test/127.0.0.1`, so a `.test` alias resolves
+/// on its own. Anything else needs either `urls_in_hosts: true`, which lets darp
+/// manage a hosts-file entry, or a DNS source the engineer runs themselves. Without
+/// one of those, the alias gets an nginx vhost and a `darp urls` line but cannot be
+/// reached from a host browser.
+///
+/// Returns nothing when `urls_in_hosts` is on — darp handles resolution then — and
+/// covers TCP services too, whose clients need the name to resolve just as much.
+pub fn collect_unresolved_aliases(
+    services: &[PlannedService],
+    urls_in_hosts: bool,
+) -> Vec<UnresolvedAlias> {
+    if urls_in_hosts {
+        return Vec::new();
+    }
+
+    let mut entries: Vec<UnresolvedAlias> = services
+        .iter()
+        .flat_map(|svc| {
+            svc.aliases
+                .iter()
+                .filter(|a| !alias::is_dnsmasq_wildcard_hostname(a))
+                .map(|a| UnresolvedAlias {
+                    domain: svc.domain.clone(),
+                    group: svc.group.clone(),
+                    service: svc.service.clone(),
+                    hostname: a.clone(),
+                })
+        })
+        .collect();
+
+    // Discovery order comes from read_dir, so sort before reporting.
+    entries.sort();
+    entries.dedup();
+    entries
+}
+
+/// Render one consolidated warning for every alias darp did not make resolvable, or
+/// `None` when there is nothing to report.
+///
+/// Deliberately does not claim the names cannot resolve: an engineer may already run
+/// their own DNS pointing them at 127.0.0.1, which is a perfectly good answer. It
+/// says what darp did and did not configure, and names the one setting that changes
+/// that.
+pub fn render_unresolved_alias_warning(entries: &[UnresolvedAlias]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut msg = String::from(
+        "Warning: darp did not create host DNS mappings for these non-.test aliases:\n\n",
+    );
+    let mut current: Option<(&str, &str, &str)> = None;
+    for entry in entries {
+        let identity = (
+            entry.domain.as_str(),
+            entry.group.as_str(),
+            entry.service.as_str(),
+        );
+        if current != Some(identity) {
+            msg.push_str(&format!(
+                "  {}/{}/{}\n",
+                entry.domain, entry.group, entry.service
+            ));
+            current = Some(identity);
+        }
+        msg.push_str(&format!("    {}\n", entry.hostname));
+    }
+    msg.push_str(
+        "\ndarp's dnsmasq configuration resolves .test names only. To let darp manage\n\
+         resolution for these aliases, enable hosts-file synchronization:\n\
+         \n  darp config set urls-in-hosts true\n\
+         \nThe reverse-proxy configuration was generated, but these aliases require either\n\
+         hosts-file synchronization or another DNS source that resolves them to 127.0.0.1.",
+    );
+
+    Some(msg)
+}
+
 /// Build the full `vhost_container.conf` — one nginx server block per hostname of
 /// every host-routed service, all proxying to that service's upstream port.
 ///
@@ -595,6 +686,11 @@ pub fn cmd_deploy(
     validate_plan_aliases(&mut services)?;
     detect_hostname_collisions(&services)?;
 
+    // Collected here, reported at the end of the run so it isn't scrolled off by the
+    // debug-port table and the container restarts.
+    let urls_in_hosts = config.urls_in_hosts.unwrap_or(false);
+    let unresolved = collect_unresolved_aliases(&services, urls_in_hosts);
+
     // ---- Generate artifacts and restart infrastructure ----
 
     // Refresh the embedded nginx.conf on every deploy so fixes to assets/nginx.conf
@@ -655,13 +751,18 @@ pub fn cmd_deploy(
     engine.stop_running_darps()?;
 
     // Optionally sync /etc/hosts if urls_in_hosts is enabled
-    if config.urls_in_hosts.unwrap_or(false) {
+    if urls_in_hosts {
         let os = OsIntegration::new(paths, config, &engine.kind);
         os.sync_system_hosts(&hosts_container_lines)?;
 
         if config.wsl.unwrap_or(false) {
             os.sync_windows_hosts(&hosts_container_lines)?;
         }
+    }
+
+    // Non-fatal: the aliases may already resolve through DNS the engineer manages.
+    if let Some(warning) = render_unresolved_alias_warning(&unresolved) {
+        eprintln!("\n{warning}");
     }
 
     Ok(())

@@ -8,7 +8,8 @@
 use darp::alias::{AliasErrorReason, validate_and_normalize_alias};
 use darp::commands::{
     PlannedService, build_host_proxy_vhost, build_hosts_lines, build_portmap,
-    build_vhost_container_conf, detect_hostname_collisions, plan_deployment, validate_plan_aliases,
+    build_vhost_container_conf, collect_unresolved_aliases, detect_hostname_collisions,
+    plan_deployment, render_unresolved_alias_warning, validate_plan_aliases,
 };
 use darp::config::{Config, DarpPaths, merge_values};
 
@@ -1133,4 +1134,245 @@ fn a_collision_leaves_existing_deployment_artifacts_untouched() {
     // Everything the old deployment depends on — vhosts, container hosts, portmap —
     // survives, and no infrastructure container was touched to get here.
     s.assert_artifacts_untouched();
+}
+
+// ---------------------------------------------------------------------------
+// Non-.test aliases without darp-managed host resolution
+// ---------------------------------------------------------------------------
+
+/// Collect and render in one step, the way deploy does.
+fn warning_for(services: &[PlannedService], urls_in_hosts: bool) -> Option<String> {
+    render_unresolved_alias_warning(&collect_unresolved_aliases(services, urls_in_hosts))
+}
+
+#[test]
+fn no_warning_when_no_aliases_are_configured() {
+    let services = vec![planned("comagine", ".", "nevada-hdr", &[])];
+
+    assert!(warning_for(&services, false).is_none());
+}
+
+#[test]
+fn no_warning_when_every_alias_ends_in_test() {
+    // dnsmasq already answers for .test via `address=/.test/127.0.0.1`.
+    let mut services = vec![planned(
+        "comagine",
+        ".",
+        "portal-website",
+        &["tenant-a.portal.test", "TENANT-B.PORTAL.TEST"],
+    )];
+    validate_plan_aliases(&mut services).unwrap();
+
+    assert!(warning_for(&services, false).is_none());
+}
+
+#[test]
+fn test_suffix_detection_is_case_insensitive_and_dot_tolerant() {
+    // Normalization has already lowercased and stripped the trailing dot, so both
+    // spellings must be recognized as covered by the wildcard.
+    let mut services = vec![planned(
+        "comagine",
+        ".",
+        "portal-website",
+        &["Tenant-A.Portal.TEST", "tenant-b.portal.test."],
+    )];
+    validate_plan_aliases(&mut services).unwrap();
+
+    assert!(warning_for(&services, false).is_none());
+}
+
+#[test]
+fn a_test_label_that_is_not_the_suffix_still_warns() {
+    // `example.test.invalid` is not a .test name — dnsmasq will not answer for it.
+    let services = vec![planned(
+        "comagine",
+        ".",
+        "portal-website",
+        &["example.test.invalid"],
+    )];
+
+    let warning = warning_for(&services, false).expect("should warn");
+    assert!(warning.contains("example.test.invalid"));
+}
+
+#[test]
+fn no_warning_when_urls_in_hosts_is_enabled() {
+    // darp manages the hosts entry itself, so the name resolves.
+    let services = vec![planned(
+        "comagine",
+        ".",
+        "portal-website",
+        &["local.zoo.org"],
+    )];
+
+    assert!(warning_for(&services, true).is_none());
+}
+
+#[test]
+fn warns_when_urls_in_hosts_is_absent_or_false() {
+    let services = vec![planned(
+        "comagine",
+        ".",
+        "portal-website",
+        &["local.zoo.org"],
+    )];
+
+    // An absent `urls_in_hosts` reaches deploy as `unwrap_or(false)`, so both the
+    // unset and the explicitly-disabled config take this path.
+    let config: Config = serde_json::from_str("{}").unwrap();
+    assert_eq!(config.urls_in_hosts, None);
+    assert!(warning_for(&services, config.urls_in_hosts.unwrap_or(false)).is_some());
+
+    let config: Config = serde_json::from_str(r#"{"urls_in_hosts": false}"#).unwrap();
+    assert_eq!(config.urls_in_hosts, Some(false));
+    assert!(warning_for(&services, config.urls_in_hosts.unwrap_or(false)).is_some());
+}
+
+#[test]
+fn one_consolidated_warning_covers_every_service_and_alias() {
+    let services = vec![
+        planned(
+            "comagine",
+            ".",
+            "portal-website",
+            &["local.care.org", "local.zoo.org", "tenant.portal.test"],
+        ),
+        planned_full(
+            "comagine",
+            "sites",
+            "zoo-website",
+            "http",
+            50101,
+            &["local.zoo-app.org"],
+        ),
+    ];
+
+    let warning = warning_for(&services, false).expect("should warn");
+
+    // One header, not one warning per alias.
+    assert_eq!(
+        warning
+            .matches("darp did not create host DNS mappings")
+            .count(),
+        1
+    );
+    assert!(warning.contains("  comagine/./portal-website\n"));
+    assert!(warning.contains("    local.care.org\n"));
+    assert!(warning.contains("    local.zoo.org\n"));
+    assert!(warning.contains("  comagine/sites/zoo-website\n"));
+    assert!(warning.contains("    local.zoo-app.org\n"));
+    // The .test alias is resolved by dnsmasq and stays out of the list.
+    assert!(!warning.contains("tenant.portal.test"));
+}
+
+#[test]
+fn warning_names_the_setting_that_fixes_it() {
+    let services = vec![planned(
+        "comagine",
+        ".",
+        "portal-website",
+        &["local.zoo.org"],
+    )];
+
+    let warning = warning_for(&services, false).unwrap();
+
+    assert!(warning.contains("darp config set urls-in-hosts true"));
+    // Does not claim the names cannot resolve — the engineer may run their own DNS.
+    assert!(warning.contains("another DNS source that resolves them to 127.0.0.1"));
+}
+
+#[test]
+fn warning_entries_are_deduplicated_and_deterministically_ordered() {
+    // A TCP and an HTTP service may legitimately share a hostname, and read_dir hands
+    // services over in an arbitrary order.
+    let services = vec![
+        planned_full(
+            "uhin",
+            "b",
+            "svc",
+            "http",
+            50101,
+            &["z.zoo.org", "a.zoo.org"],
+        ),
+        planned_full("uhin", ".", "queue", "tcp", 50100, &["a.zoo.org"]),
+        planned_full("uhin", ".", "queue", "tcp", 50100, &["a.zoo.org"]),
+    ];
+
+    let entries = collect_unresolved_aliases(&services, false);
+
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| (e.group.as_str(), e.service.as_str(), e.hostname.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (".", "queue", "a.zoo.org"),
+            ("b", "svc", "a.zoo.org"),
+            ("b", "svc", "z.zoo.org"),
+        ]
+    );
+}
+
+#[test]
+fn tcp_service_aliases_are_warned_about_too() {
+    // A TCP client has to resolve the hostname before it can reach the mapped port.
+    let services = vec![planned_full(
+        "uhin",
+        ".",
+        "queue",
+        "tcp",
+        50100,
+        &["local.queue.org"],
+    )];
+
+    let warning = warning_for(&services, false).expect("should warn");
+    assert!(warning.contains("local.queue.org"));
+}
+
+#[test]
+fn services_configured_but_absent_on_disk_do_not_warn() {
+    // `portal-website` has the alias but was never cloned; only `queue` is on disk.
+    let s = scratch(
+        &["queue"],
+        r#"{
+            "domains": {
+                "comagine": {
+                    "location": "{loc}",
+                    "groups": {
+                        ".": {
+                            "services": {
+                                "portal-website": { "urls": ["local.zoo.org"] },
+                                "queue": { "connection_type": "tcp" }
+                            }
+                        }
+                    }
+                }
+            }
+        }"#,
+    );
+
+    let mut services = plan_deployment(&s.paths, &s.config).unwrap();
+    validate_plan_aliases(&mut services).unwrap();
+
+    assert!(warning_for(&services, false).is_none());
+}
+
+#[test]
+fn the_warning_does_not_stop_artifact_generation() {
+    // Non-fatal by design: deploy still emits the vhost, because the alias may resolve
+    // through DNS darp knows nothing about.
+    let mut services = vec![planned(
+        "comagine",
+        ".",
+        "portal-website",
+        &["local.zoo.org"],
+    )];
+    validate_plan_aliases(&mut services).unwrap();
+
+    assert!(warning_for(&services, false).is_some());
+    assert!(detect_hostname_collisions(&services).is_ok());
+
+    let conf = build_vhost_container_conf(&services, "gw");
+    assert!(conf.contains("server_name local.zoo.org;"));
+    assert!(build_hosts_lines(&services).contains(&"0.0.0.0   local.zoo.org\n".to_string()));
 }

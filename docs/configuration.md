@@ -127,14 +127,42 @@ from its folder name. `urls` adds more:
 }
 ```
 
-`darp deploy` then writes a `/etc/hosts` entry and an nginx `server` block for
-each alias, all proxying to the same upstream port as the canonical URL. `darp
-urls` lists aliases indented under their service.
+`darp deploy` then writes an nginx `server` block for each alias, all proxying to
+the same upstream port as the canonical URL, and a `hosts_container` entry so the
+name works between containers. `darp urls` lists aliases indented under their
+service.
 
-Aliases do not have to end in `.test` — darp writes a hosts entry for each one,
-so any name resolves to the loopback the reverse proxy listens on. (Only `.test`
-is wildcard-resolved by dnsmasq; everything else needs the hosts entry, which is
-exactly what this provides.)
+### Making a non-`.test` alias resolve
+
+Aliases do not have to end in `.test`, but darp only resolves the name for you in
+some cases:
+
+| Alias | Resolves on the host because |
+|---|---|
+| `tenant-a.portal.test` | darp's dnsmasq rule `address=/.test/127.0.0.1` wildcards every `.test` name. Nothing else needed. |
+| `local.zoo.org` | Only with `urls_in_hosts: true`, which lets darp manage an entry in your system hosts file — or with another DNS source you run that resolves the name to `127.0.0.1`. |
+
+Configuring an alias does **not** implicitly enable or modify hosts-file
+synchronization; `urls_in_hosts` stays whatever you set it to. When darp detects
+a non-`.test` alias and `urls_in_hosts` is off, `darp deploy` prints a warning
+naming each affected service and alias, and points at:
+
+```sh
+darp config set urls-in-hosts true
+```
+
+The warning is informational — deployment continues, because darp cannot tell
+whether you already resolve those names some other way.
+
+WSL users who need the alias to work in **Windows** applications (a browser on
+the Windows side, for instance) may also need:
+
+```sh
+darp config set wsl true
+```
+
+which syncs the Windows hosts file alongside the Linux one. darp does not warn
+when `wsl` is false, since resolution inside WSL alone is a legitimate setup.
 
 This exists for apps that behave differently per hostname — a multi-tenant
 front-end that picks its tenant from `window.location.hostname`, for instance.

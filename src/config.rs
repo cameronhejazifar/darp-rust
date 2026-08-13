@@ -406,13 +406,16 @@ pub struct Service {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_environment: Option<String>,
     /// Extra hostnames that reach this service alongside its canonical
-    /// `{service}.{domain}.test` URL. Each one gets its own `/etc/hosts` entry and
-    /// its own nginx vhost proxying to the same upstream port, so a single dev
-    /// server can answer for several front-end hosts — e.g. a multi-tenant SPA that
-    /// selects its tenant from `window.location.hostname`.
+    /// `{service}.{domain}.test` URL. Each one gets its own nginx vhost proxying to
+    /// the same upstream port, so a single dev server can answer for several
+    /// front-end hosts — e.g. a multi-tenant SPA that selects its tenant from
+    /// `window.location.hostname`.
     ///
-    /// Aliases need not end in `.test`; darp writes a hosts entry for each, so
-    /// arbitrary names resolve to the loopback the reverse proxy listens on.
+    /// Aliases need not end in `.test`, but darp only makes `.test` names resolve on
+    /// its own (dnsmasq wildcards them). Any other name reaches the host browser only
+    /// with `urls_in_hosts: true`, which lets darp manage a system hosts entry, or via
+    /// a DNS source the engineer runs themselves. Configuring an alias does not enable
+    /// hosts synchronization; deploy warns instead.
     ///
     /// Values are hostnames, not URLs: `crate::alias::validate_and_normalize_alias`
     /// rejects schemes, ports, paths, wildcards, and IP literals at deploy time, and

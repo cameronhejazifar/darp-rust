@@ -144,6 +144,53 @@ the original hostname in the `Host` header and can branch on it.
 `urls` is service-level only and applies at deploy time. It does not cascade
 through group/domain/environment and has no `*urls` override form.
 
+### Hostname rules
+
+An alias value is a **hostname, not a URL**. `darp deploy` validates every alias
+before it writes anything, and rejects the whole deploy — leaving the previous
+deployment untouched — if any value is malformed. Every invalid alias across
+every service is reported in one error.
+
+Not allowed:
+
+- Schemes (`http://`, `https://`), ports, paths, query strings, fragments, and
+  user information.
+- Whitespace, control characters, and characters that would alter nginx or
+  hosts-file syntax (`;`, `{`, `}`, quotes, backslash).
+- Wildcards such as `*.zoo.org`.
+- IPv4 and IPv6 address literals — `urls` names alternate hostnames, not
+  alternate listener addresses.
+- Labels that are empty, longer than 63 characters, or that begin or end with a
+  hyphen; hostnames longer than 253 characters.
+- Raw non-ASCII names. Internationalized hostnames must be supplied in
+  ASCII/Punycode form (`xn--…`).
+
+Normalization applied to accepted values:
+
+- Surrounding whitespace is trimmed.
+- One optional trailing DNS dot is accepted and removed (`local.zoo.org.` →
+  `local.zoo.org`).
+- ASCII letters are lowercased, since DNS is case-insensitive.
+
+The normalized value is what lands in the nginx `server_name`, the hosts files,
+`portmap.json`, and `darp urls` output.
+
+Valid:
+
+```json
+"urls": ["local.zoo.org", "tenant-a.portal.test"]
+```
+
+Invalid:
+
+```json
+"urls": [
+  "https://local.zoo.org",
+  "local.zoo.org:8080",
+  "local.zoo.org/path"
+]
+```
+
 ## Viewing Resolved Config
 
 To see what settings would apply at your current directory:

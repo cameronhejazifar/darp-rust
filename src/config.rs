@@ -414,6 +414,10 @@ pub struct Service {
     /// Aliases need not end in `.test`; darp writes a hosts entry for each, so
     /// arbitrary names resolve to the loopback the reverse proxy listens on.
     ///
+    /// Values are hostnames, not URLs: `crate::alias::validate_and_normalize_alias`
+    /// rejects schemes, ports, paths, wildcards, and IP literals at deploy time, and
+    /// normalizes what remains (trim, drop one trailing dot, lowercase).
+    ///
     /// Service-level and deploy-time only: an alias names one specific project, so
     /// this field does not participate in the settings cascade and has no `*urls`
     /// counterpart.
